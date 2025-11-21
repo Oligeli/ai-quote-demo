@@ -1,291 +1,306 @@
 import os
-import imaplib
-import smtplib
-import email
-from email.header import decode_header
-from email.mime.text import MIMEText
+import json
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, request, render_template_string
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Lokálne si vieš pomôcť .env, na Renderi sa použijú env variables
+# Na lokál test načítame .env, na Renderi sa použijú environment variables
 load_dotenv()
 
-# ----- ENV PREMENNÉ -----
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-IMAP_HOST = os.getenv("IMAP_HOST")
-IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
-IMAP_USER = os.getenv("IMAP_USER")
-IMAP_PASSWORD = os.getenv("IMAP_PASSWORD")
-
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-EMAIL_FROM = os.getenv("EMAIL_FROM")  # adresa, z ktorej ide ponuka
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 app = Flask(__name__)
 
-# Jednoduchý cenník – demo
-PRICE_LIST = {
-    "VIZITKY_4_4_500": 0.08,   # 0,08 €/ks, 500 ks
-    "LETÁKY_A5_1000": 0.05,    # 0,05 €/ks, 1000 ks
-}
+# --------------------------------------------------------------------
+# KATALÓG FÓLIÍ – TU SI BUDEŠ NAPLŇAŤ SVOJE PRODUKTY / CENNÍK
+# --------------------------------------------------------------------
+FOIL_PRODUCTS = [
+    {
+        "code": "XPEL_ULTIMATE_PLUS",
+        "brand": "XPEL",
+        "name": "XPEL Ultimate Plus",
+        "finish": "lesk",
+        "thickness_microns": 200,
+        "price_per_m2": 65.0,
+        "recommended_for": "maximálna ochrana laku, autá vyššej triedy, dlhodobé používanie",
+    },
+    {
+        "code": "XPEL_STEALTH",
+        "brand": "XPEL",
+        "name": "XPEL Stealth",
+        "finish": "mat",
+        "thickness_microns": 200,
+        "price_per_m2": 70.0,
+        "recommended_for": "matný vzhľad, zmena dizajnu, ochrana aj estetický efekt",
+    },
+    {
+        "code": "XPEL_ECONOMY",
+        "brand": "XPEL",
+        "name": "XPEL Economy",
+        "finish": "lesk",
+        "thickness_microns": 150,
+        "price_per_m2": 45.0,
+        "recommended_for": "cenovo citliví zákazníci, základná ochrana, firemné autá",
+    },
+]
 
 
-def calculate_items():
+# --------------------------------------------------------------------
+# POMOCNÉ FUNKCIE – "MOZOG NA FÓLIE" + CENOTVORBA
+# --------------------------------------------------------------------
+
+def ai_select_foil(email_text: str) -> dict:
     """
-    DEMO: Nasimulované položky, ktoré by sme normálne vyťahovali z e-mailu.
+    AI 'mozog na fólie':
+    - prečíta text dopytu,
+    - pozrie sa na FOIL_PRODUCTS,
+    - vyberie najvhodnejší produkt,
+    - odhadne plochu v m2,
+    - vráti JSON.
     """
-    requested_items = [
-        {"code": "VIZITKY_4_4_500", "qty": 500},
-        {"code": "LETÁKY_A5_1000", "qty": 1000},
-    ]
-
-    items_with_prices = []
-    total_without_vat = 0.0
-
-    for item in requested_items:
-        code = item["code"]
-        qty = item["qty"]
-        unit_price = PRICE_LIST.get(code)
-
-        if unit_price is None:
-            continue
-
-        line_total = unit_price * qty
-        total_without_vat += line_total
-
-        items_with_prices.append({
-            "code": code,
-            "qty": qty,
-            "unit_price": unit_price,
-            "line_total": line_total
-        })
-
-    vat = total_without_vat * 0.20
-    total_with_vat = total_without_vat + vat
-
-    return items_with_prices, total_without_vat, vat, total_with_vat
-
-
-def generate_quote_email_text(items_with_prices, total_with_vat, original_subject=None, original_body=None):
-    """
-    Vygeneruje text cenovej ponuky pomocou GPT.
-    """
-    if not client:
-        # fallback keď nie je API key – aby demo nespadlo
-        lines = []
-        for item in items_with_prices:
-            lines.append(
-                f"{item['code']} – {item['qty']} ks × {item['unit_price']:.2f} € = {item['line_total']:.2f} €"
-            )
-        items_text = "\n".join(lines)
-        return (
-            "DEMO BEZ OPENAI API\n\n"
-            "Položky:\n"
-            f"{items_text}\n\n"
-            f"Celková cena s DPH: {total_with_vat:.2f} €"
-        )
-
-    # Popis položiek
-    items_text_lines = []
-    for item in items_with_prices:
-        line = (
-            f"- {item['code']} | množstvo: {item['qty']} ks | "
-            f"cena za ks: {item['unit_price']:.2f} € | spolu: {item['line_total']:.2f} €"
-        )
-        items_text_lines.append(line)
-    items_text = "\n".join(items_text_lines)
-
-    extra_context = ""
-    if original_subject:
-        extra_context += f"Predmet pôvodného dopytu: {original_subject}\n"
-    if original_body:
-        extra_context += f"Text pôvodného e-mailu:\n{original_body[:1000]}\n"  # skrátime pre istotu
+    catalog_str = json.dumps(FOIL_PRODUCTS, ensure_ascii=False)
 
     prompt = f"""
-Si obchodný asistent firmy, ktorá robí cenové ponuky.
+Si odborník na ochranné fólie na autá (PPF). Máš katalóg produktov (XPEL a pod.).
+Na základe textu dopytu vyber najvhodnejší produkt z katalógu a odhadni plochu v m².
 
-Na základe nasledujúcich položiek vytvor e-mail s cenovou ponukou v slovenčine.
-Buď profesionálny, ale ľudský, vykaj. V úvode poďakuj za dopyt,
-potom prehľadne zhrň položky a ceny a na konci jasne uveď CELKOVÚ cenu s DPH
-a informáciu o termíne dodania a platnosti ponuky.
+Výstup vráť STRICTNE ako platný JSON s týmito kľúčmi:
+- "product_code": kód vybraného produktu z katalógu (pole 'code')
+- "area_m2": číselný odhad plochy v m², ktorú chce zákazník polepiť
+- "reason": krátke vysvetlenie (po slovensky), prečo si vybral práve tento produkt
+- "notes_for_pricing": poznámky pre cenotvorbu (napr. či je to len nárazník, celá predná časť, celé auto...)
 
-Položky:
-{items_text}
+KATALÓG PRODUKTOV (JSON):
+{catalog_str}
 
-Celková cena s DPH: {total_with_vat:.2f} €
-
-Doplňujúci kontext:
-{extra_context}
+TEXT DOPYTU:
+{email_text}
 """
+
+    if not client:
+        # Fallback, ak nemáš nastavený OPENAI_API_KEY – aby demo nespadlo
+        return {
+            "product_code": "XPEL_ULTIMATE_PLUS",
+            "area_m2": 4.0,
+            "reason": "DEMO režim bez OpenAI – vyberám XPEL Ultimate Plus.",
+            "notes_for_pricing": "Predná časť auta – odhad."
+        }
 
     response = client.responses.create(
         model="gpt-4o-mini",
         input=[
-            {
-                "role": "system",
-                "content": "Si slušný obchodník, píšeš stručné a jasné cenové ponuky v slovenčine."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": "Si odborník na PPF fólie a pomáhaš vybrať správny typ fólie."},
+            {"role": "user", "content": prompt}
         ],
     )
 
-    email_text = response.output_text
-    return email_text
+    raw = response.output_text.strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # fallback keď sa náhodou netrafí úplne JSON
+        data = {
+            "product_code": None,
+            "area_m2": 4.0,
+            "reason": f"Nepodarilo sa načítať JSON. AI odpoveď bola: {raw}",
+            "notes_for_pricing": ""
+        }
+
+    return data
 
 
-def send_email(to_addr, subject, body):
+def find_product_by_code(code: str):
+    for p in FOIL_PRODUCTS:
+        if p["code"] == code:
+            return p
+    return None
+
+
+def calculate_price(selection: dict):
     """
-    Pošle e-mail cez SMTP.
+    Pre vybraný produkt a odhad plochy spočíta cenu.
+    Zahŕňa: materiál + práca + DPH 20 %.
     """
-    msg = MIMEText(body, _charset="utf-8")
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM or SMTP_USER
-    msg["To"] = to_addr
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-
-    print(f"📨 Sent quote e-mail to {to_addr}")
-
-
-def fetch_latest_unseen_email():
-    """
-    Stiahne najnovší neprečítaný e-mail z IMAP schránky.
-    Vráti (from_addr, subject, body_text) alebo None, ak žiadny nie je.
-    """
-    if not all([IMAP_HOST, IMAP_USER, IMAP_PASSWORD]):
-        print("❗ Chýbajú IMAP nastavenia.")
+    product = find_product_by_code(selection.get("product_code"))
+    if not product:
         return None
 
-    mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
-    mail.login(IMAP_USER, IMAP_PASSWORD)
-    mail.select("INBOX")
+    try:
+        area = float(selection.get("area_m2", 0))
+    except (TypeError, ValueError):
+        area = 0
 
-    status, messages = mail.search(None, "(UNSEEN)")
-    if status != "OK":
-        mail.logout()
-        return None
+    price_per_m2 = product["price_per_m2"]
 
-    msg_ids = messages[0].split()
-    if not msg_ids:
-        mail.logout()
-        return None
+    material_price = area * price_per_m2
+    # Jednoduchý príklad práce: 40 €/m²
+    labour_price = area * 40.0
+    total_without_vat = material_price + labour_price
+    vat = total_without_vat * 0.20
+    total_with_vat = total_without_vat + vat
 
-    latest_id = msg_ids[-1]
-    status, msg_data = mail.fetch(latest_id, "(RFC822)")
-    if status != "OK":
-        mail.logout()
-        return None
+    return {
+        "product": product,
+        "area_m2": area,
+        "material_price": material_price,
+        "labour_price": labour_price,
+        "total_without_vat": total_without_vat,
+        "vat": vat,
+        "total_with_vat": total_with_vat,
+    }
 
-    raw_email = msg_data[0][1]
-    msg = email.message_from_bytes(raw_email)
 
-    # From
-    from_addr = email.utils.parseaddr(msg.get("From"))[1]
+def generate_quote_email(email_text: str) -> dict:
+    """
+    Kompletný flow:
+    - AI vyberie fóliu + odhadne plochu,
+    - spočíta cenu,
+    - AI vygeneruje text emailu s ponukou.
+    Vráti dict s email_text + debug dátami.
+    """
+    selection = ai_select_foil(email_text)
+    pricing = calculate_price(selection)
 
-    # Subject
-    raw_subject = msg.get("Subject", "")
-    dh = decode_header(raw_subject)[0]
-    if isinstance(dh[0], bytes):
-        subject = dh[0].decode(dh[1] or "utf-8", errors="ignore")
+    if not pricing:
+        return {
+            "email_text": "Ospravedlňujeme sa, nepodarilo sa nájsť vhodný produkt v cenníku.",
+            "selection": selection,
+            "pricing": None
+        }
+
+    product = pricing["product"]
+
+    summary_for_ai = f"""
+Vybraná fólia: {product['name']} ({product['code']})
+Značka: {product['brand']}
+Povrch: {product['finish']}
+Hrúbka: {product['thickness_microns']} mikrónov
+Odporúčané použitie: {product['recommended_for']}
+
+Odhadovaná plocha: {pricing['area_m2']:.2f} m²
+Cena materiálu (fólia): {pricing['material_price']:.2f} €
+Cena práce: {pricing['labour_price']:.2f} €
+Medzisúčet bez DPH: {pricing['total_without_vat']:.2f} €
+DPH 20 %: {pricing['vat']:.2f} €
+Celková cena s DPH: {pricing['total_with_vat']:.2f} €
+
+Dôvod výberu fólie (AI): {selection.get('reason', '')}
+Poznámky k použitiu: {selection.get('notes_for_pricing', '')}
+"""
+
+    if not client:
+        # fallback text, keď nemáš API key
+        email_text_out = (
+            "DEMO bez OpenAI API – ukážka dát, ktoré by šli do ponuky:\n\n"
+            + summary_for_ai
+        )
     else:
-        subject = dh[0]
+        prompt = f"""
+Na základe nasledujúcich informácií priprav profesionálnu cenovú ponuku v slovenčine.
+Na začiatku poďakuj za dopyt, zhrň čo odporúčaš (typ fólie a prečo),
+uved prehľadnú tabuľku / zoznam ceny (materiál, práca, celková cena s DPH)
+a na konci pridaj informáciu o termíne montáže a platnosti ponuky.
+Píš vecne, ale ľudsky, vykaj.
 
-    # Body – prvá textová časť
-    body_text = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition"))
-            if content_type == "text/plain" and "attachment" not in content_disposition:
-                charset = part.get_content_charset() or "utf-8"
-                body_text = part.get_payload(decode=True).decode(charset, errors="ignore")
-                break
-    else:
-        charset = msg.get_content_charset() or "utf-8"
-        body_text = msg.get_payload(decode=True).decode(charset, errors="ignore")
+Informácie:
+{summary_for_ai}
+"""
 
-    # Označíme ako prečítané
-    mail.store(latest_id, "+FLAGS", "\\Seen")
-    mail.logout()
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {
+                    "role": "system",
+                    "content": "Si obchodník, ktorý pripravuje cenové ponuky na ochranné fólie XPEL."
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        email_text_out = response.output_text
 
-    return from_addr, subject, body_text
+    return {
+        "email_text": email_text_out,
+        "selection": selection,
+        "pricing": pricing
+    }
 
 
-@app.route("/")
+# --------------------------------------------------------------------
+# FLASK ROUTES – WEBOVÉ ROZHRANIE (FORMULÁR + VÝSLEDOK)
+# --------------------------------------------------------------------
+
+INDEX_TEMPLATE = """
+<!doctype html>
+<html lang="sk">
+<head>
+  <meta charset="utf-8">
+  <title>AI cenová ponuka – fólie XPEL (demo)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif; margin: 2rem auto; max-width: 900px; line-height: 1.5; }
+    textarea { width: 100%; min-height: 180px; padding: 0.75rem; font-family: inherit; font-size: 1rem; }
+    button { padding: 0.6rem 1.4rem; font-size: 1rem; cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; margin-top: 1rem; background: #fafafa; }
+    pre { white-space: pre-wrap; font-size: 0.95rem; }
+    .debug { font-size: 0.85rem; color: #555; }
+    label { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>AI cenová ponuka – fólie XPEL (demo)</h1>
+  <p>Napíš sem text dopytu, ako keby ti zákazník poslal e-mail (napr. „Zdravím, chcel by som XPEL fóliu na prednú časť auta…“).</p>
+
+  <form method="post" action="/generate">
+    <label for="email_text">Text dopytu:</label><br>
+    <textarea id="email_text" name="email_text" required>{{ email_text or '' }}</textarea>
+    <br><br>
+    <button type="submit">Vygenerovať cenovú ponuku</button>
+  </form>
+
+  {% if result %}
+    <div class="card">
+      <h2>Vygenerovaný text cenovej ponuky:</h2>
+      <pre>{{ result.email_text }}</pre>
+    </div>
+
+    <div class="card debug">
+      <h3>Debug – AI výber produktu a výpočet ceny:</h3>
+      <pre>{{ debug_json }}</pre>
+    </div>
+  {% endif %}
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET"])
 def index():
-    return """
-    <h1>AI cenová ponuka – demo (Render + IMAP/SMTP)</h1>
-    <p>1. Pošli testovací e-mail na schránku, ktorú tento skript číta (IMAP_USER).</p>
-    <p>2. Potom choď na <a href="/check_email">/check_email</a> – spracuje najnovší neprečítaný e-mail a odošle ponuku späť.</p>
-    """
+    return render_template_string(INDEX_TEMPLATE, result=None, email_text="", debug_json="")
 
+@app.route("/generate", methods=["POST"])
+def generate():
+    email_text = request.form.get("email_text", "")
+    result = generate_quote_email(email_text)
 
-@app.route("/check_email", methods=["GET"])
-def check_email():
-    """
-    Skontroluje IMAP schránku, spracuje najnovší neprečítaný e-mail
-    a odošle automatickú ponuku späť odosielateľovi.
-    """
-    result = fetch_latest_unseen_email()
-    if not result:
-        return jsonify({"status": "no_unseen_email"}), 200
+    debug_data = {
+        "selection": result["selection"],
+        "pricing": result["pricing"],
+    }
 
-    from_addr, subject, body_text = result
-
-    # Demo: spočítame fixné položky z cenníka
-    items_with_prices, total_without_vat, vat, total_with_vat = calculate_items()
-
-    # Vygenerujeme text ponuky s kontextom pôvodného mailu
-    email_text = generate_quote_email_text(
-        items_with_prices,
-        total_with_vat,
-        original_subject=subject,
-        original_body=body_text,
+    return render_template_string(
+        INDEX_TEMPLATE,
+        result=result,
+        email_text=email_text,
+        debug_json=json.dumps(debug_data, ensure_ascii=False, indent=2)
     )
 
-    # Tepelne jednoducho: odošleme naspäť odosielateľovi
-    reply_subject = f"Re: {subject}" if subject else "Vaša cenová ponuka"
-    send_email(from_addr, reply_subject, email_text)
- 
-    return jsonify({
-        "status": "quote_sent",
-        "to": from_addr,
-        "subject": reply_subject,
-        "preview": email_text[:300] + "..."
-    }), 200
 
-
-@app.route("/trigger_example", methods=["GET"])
-def trigger_example():
-    """
-    Čisté demo bez IMAPu – len vygeneruje ponuku a zobrazí ju v prehliadači.
-    """
-    items_with_prices, total_without_vat, vat, total_with_vat = calculate_items()
-    email_text = generate_quote_email_text(items_with_prices, total_with_vat)
-
-    html_template = """
-    <h1>Návrh cenovej ponuky (demo)</h1>
-    <h2>Text ponuky:</h2>
-    <pre style="white-space: pre-wrap; border:1px solid #ddd; padding:1rem; border-radius:8px;">
-{{ email_text }}
-    </pre>
-    """
-
-    return render_template_string(html_template, email_text=email_text)
+# health-check / info
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "has_openai": bool(client)}
 
 
 if __name__ == "__main__":
