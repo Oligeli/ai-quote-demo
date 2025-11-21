@@ -260,7 +260,7 @@ def check_email():
     # Tepelne jednoducho: odošleme naspäť odosielateľovi
     reply_subject = f"Re: {subject}" if subject else "Vaša cenová ponuka"
     send_email(from_addr, reply_subject, email_text)
-
+ 
     return jsonify({
         "status": "quote_sent",
         "to": from_addr,
